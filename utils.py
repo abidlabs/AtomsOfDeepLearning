@@ -2,6 +2,7 @@ import tensorflow as tf
 import numpy as np
 import time    
 from IPython.display import clear_output, Image, display, HTML
+import warnings
 
 def strip_consts(graph_def, max_const_size=32):
     """Strip large constant values from graph_def."""
@@ -216,20 +217,70 @@ def recurrent_multilayer_perceptron(x, num_nodes, num_input=1, num_output=1, act
     
     return out
 
+'''
+A class to organize methods that generate datasets for some of the experiments
+'''
+class Dataset():
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.model_selection import train_test_split
+    
+    @classmethod
+    def generate_mixture_of_gaussians(cls, n, d, class_seps=[1], covariance_scale=1, test_size=0.2, one_hot=False, randomly_labeled=False):
+        
+        if len(class_seps)==d:
+            pass
+        elif len(class_seps)==1:
+            class_seps = np.repeat(class_seps,d)
+        else:
+            raise ValueError("class_seps must be an array of length 1 or length d")
+        
+        c = covariance_scale*np.random.random((d,d))
+        cov = c.T.dot(c)
+        
+        X1 = np.random.multivariate_normal([0]*d, cov, size=int(n/2))
+        X2 = np.random.multivariate_normal(class_seps, cov, size=int(n/2))
+                
+        X = np.concatenate([X1,X2])
+        
+        if randomly_labeled==True:
+            y = np.random.randint(0,2,2*int(n/2))
+        else:
+            y = np.array([0]*int(n/2) + [1]*int(n/2))
+        
+        if (one_hot):
+            y = y.reshape(-1,1)
+            enc = cls.OneHotEncoder(n_values=2,sparse=False)
+            y = enc.fit_transform(y)
+        
+        X_train, X_test, y_train, y_test = cls.train_test_split(X, y, test_size=test_size)
+        
+        return X_train, X_test, y_train, y_test
+    
+    def generate_MNIST(n_train, n_test, subset=range(10)):
+        from tensorflow.examples.tutorials.mnist import input_data
+        mnist = input_data.read_data_sets("MNIST_data/", one_hot=True)
+        y_train = mnist.train.labels
+        valid_idx = np.where(y_train in 
 
-#################
-# All of the Experiments, starting from a base class
-#################
+
+
+'''
+ All of the Experiments, starting from a base class
+'''
 
 class Experiment():
     def __init__(self):
         pass
     
     #ideally, this would make experiments completely reproducible, but because jobs are distributed over multiple cores, small differences may persist in practice
-    def initialize(self):
-        np.random.seed(0)
-        tf.set_random_seed(0)
+    def initialize(self, seed=0):
+        np.random.seed(seed)
+        tf.set_random_seed(seed)
+        self.timer = Timer()
+        self.timer.start()
 
+    def conclude(self):
+        self.timer.end_and_print()
 '''
 Experiment 1: Why do we use neural networks?
 Description: Performs regression using a neural network with 1 hidden layer and different number of units. Returns the original x-values, true y-values, and predicted y-values, along with the MSE loss.
@@ -323,6 +374,7 @@ class Experiment2(Experiment):
 
         return x_values.squeeze(), y_values.squeeze(), y_pred.squeeze(), loss, accuracy, n_params
 
+    
 '''
 Experiment 3: With How Much Data Are Neural Networks Better than Other Techniques?
 '''
@@ -333,8 +385,7 @@ class Experiment3(Experiment):
     def run(self,
             classifiers, 
             d = 12,
-            d_extra = 0,
-            class_sep = 1,
+            class_seps = [1],
             ns = np.logspace(2,4,10),
             iters = 3,
             covariance_scale = 1,
@@ -342,36 +393,86 @@ class Experiment3(Experiment):
             accuracy_on = 'test',
             recurrent=True):
         
-        import warnings
-        from sklearn.model_selection import train_test_split
-        from sklearn.datasets import make_classification
         
-        acc = np.zeros((len(ns),len(classifiers)))
+        acc = np.zeros((len(ns),len(classifiers),iters))
         n_max = int(np.max(ns))
 
-        c = covariance_scale*np.random.random((d+d_extra,d+d_extra))
-        cov = c.T.dot(c)
+        for k in range(iters):
         
-        X1 = np.random.multivariate_normal([0]*d+[0]*d_extra, cov, size=int(n_max/2))
-        X2 = np.random.multivariate_normal([class_sep]*d+[0]*d_extra, cov, size=int(n_max/2))
-        
-        X = np.concatenate([X1,X2])
-        y = np.array([0]*int(n_max/2) + [1]*int(n_max/2))
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size)
-
-        for i, n in enumerate(ns):
-            for j, clf in enumerate(classifiers):
-                for _ in range(iters):
+            X_train, X_test, y_train, y_test = Dataset.generate_mixture_of_gaussians(n=n_max, 
+                                                                                     d=d, 
+                                                                                     class_seps=class_seps, 
+                                                                                     covariance_scale=covariance_scale, 
+                                                                                     test_size=test_size)
+            for i, n in enumerate(ns):
+                for j, clf in enumerate(classifiers):
                     with warnings.catch_warnings():
-                        warnings.simplefilter('ignore')
-                        clf.fit(X_train[:int(n*0.8)],y_train[:int(n*0.8)])
+                        warnings.simplefilter('ignore') #MLP throws annoying errors whenever it doesn't fully converge                     
+                        n_train = int(n*(1-test_size))
+                        clf.fit(X_train[:n_train],y_train[:n_train]) #choose a subset of the training data
                         if accuracy_on=='train':
-                            acc[i,j] += clf.score(X_train[:int(n*0.8)],y_train[:int(n*0.8)])
+                            acc[i,j,k] = clf.score(X_train[:int(n*(1-test_size))],y_train[:int(n*(1-test_size))])
                         elif accuracy_on=='test':
-                            acc[i,j] += clf.score(X_test,y_test)
+                            acc[i,j,k] = clf.score(X_test,y_test)
                         else:
-                            raise ValueError("accuracy_on=='test' or accuracy_on=='train'") #the accuracy must be measured on the training or test set
+                            raise ValueError("accuracy_on must be 'test' or 'train'") 
 
-        return acc/iters
+        return acc
 
+
+'''
+Experiment 4: With How Much Data Are Neural Networks Better than Other Techniques?
+'''
+class Experiment4(Experiment):    
+    def run(self,
+            classifiers,
+            n=1000,
+            n_fakes = [0],
+            d=12,
+            verbose=False,
+            covariance_scale=1,
+            class_seps=[1],
+            hidden_layer_sizes=[100],
+            num_steps=200,
+            test_size = 0.2,
+           ):
+        
+        train_size = 1-test_size
+        
+        #the correctly-labeled training data
+        X_train_real, X_test, y_train_real, y_test = Dataset.generate_mixture_of_gaussians(n=n, 
+                                                                                 d=d, 
+                                                                                 class_seps=class_seps, 
+                                                                                 covariance_scale=covariance_scale,
+                                                                                 test_size=test_size)
+        
+        #the randomly-labeled training data
+        n_max = np.max(n_fakes)    
+        X_train_fake, _, y_train_fake, _ = Dataset.generate_mixture_of_gaussians(n=n_max, d=d,
+                                                                           class_seps=class_seps,
+                                                                           covariance_scale=covariance_scale,
+                                                                           randomly_labeled=True,
+                                                                           test_size=test_size)
+        
+        accuracies = np.zeros((len(n_fakes),len(classifiers)))
+        
+        #combine the training data together and shuffle them before applying the classifier
+        for i, n_fake in enumerate(n_fakes):
+            for j, clf in enumerate(classifiers):
+                
+                n_fake_train = int(train_size*n_fake)
+                X_train = np.concatenate([X_train_real, X_train_fake[:n_fake_train]])
+                y_train = np.concatenate([y_train_real, y_train_fake[:n_fake_train]])
+
+                idx = np.random.permutation(X_train.shape[0])
+                X_train = X_train[idx]
+                y_train = y_train[idx]
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore') #MLP throws annoying errors whenever it doesn't fully converge
+                    clf.fit(X_train,y_train)
+                                    
+                accuracies[i,j] = clf.score(X_test,y_test)
+                
+        return accuracies
 
