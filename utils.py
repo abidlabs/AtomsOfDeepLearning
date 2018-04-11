@@ -1,8 +1,8 @@
 import tensorflow as tf
 import numpy as np
-import time    
 from IPython.display import clear_output, Image, display, HTML
 import warnings
+import time    
 
 def strip_consts(graph_def, max_const_size=32):
     """Strip large constant values from graph_def."""
@@ -49,6 +49,10 @@ class Timer():
         return time.time() - self.time
     def end_and_print(self):
         print("Time needed to run experiment:",np.round(time.time()-self.time,3),"s")
+    def end_and_md_print(self):
+        from IPython.display import Markdown, display
+        string = "Time needed to run experiment: " + str(np.round(time.time()-self.time,3)) + " s"
+        display(Markdown(string))
 
 
 ##
@@ -161,6 +165,15 @@ def sparse_trig():
 ### END COMMON FUNCTIONS ###
 
 '''
+Takes the dataset and maps each column to be between 0 and 1
+'''
+def normalize(array):
+    if array.ndim>1:
+        return (array - array.min(axis=0)) / array.ptp(axis=0)
+    else:
+        return (array - array.min()) / array.ptp()        
+
+'''
 Helper function to define a multi-layer perceptron.
 x: input tensorflow node
 num_nodes: array that contains the number of nodes in each hidden layer
@@ -168,14 +181,17 @@ num_input: number of nodes in input layer
 num_output: number of nodes in output layer
 activation: the tensorflow activation function to user
 '''
-def multilayer_perceptron(x, num_nodes, num_input=1, num_output=1, activation=tf.nn.sigmoid, bias=True):
+def multilayer_perceptron(x, num_nodes, num_input=1, num_output=1, activation=tf.nn.sigmoid, bias=True, initializer=tf.contrib.layers.xavier_initializer(), return_weight_tensors=False):
     n_prev = num_input
     out = x
     num_layer = 0
+    weights = list()
+    
     for n in num_nodes:
-        w = tf.get_variable("w"+str(num_layer),[n_prev, n])        
+        w = tf.get_variable("w"+str(num_layer),[n_prev, n], initializer=initializer)
+        weights.append(w)
         if bias:
-            b = tf.get_variable("b"+str(num_layer),[n])
+            b = tf.get_variable("b"+str(num_layer),[n], initializer =initializer)
             out = activation(tf.add(tf.matmul(out,w),b),name="out"+str(num_layer))
         else:
             out = activation(tf.matmul(out,w),name="out"+str(num_layer))
@@ -183,13 +199,17 @@ def multilayer_perceptron(x, num_nodes, num_input=1, num_output=1, activation=tf
         n_prev = n
         num_layer += 1
         
-    w_out = tf.get_variable("w"+str(num_layer),[n, num_output])
+    w_out = tf.get_variable("w"+str(num_layer),[n, num_output], initializer =initializer)
+    weights.append(w_out)
+    
     if bias:
-        b_out = tf.get_variable("b"+str(num_layer),[num_output])
+        b_out = tf.get_variable("b"+str(num_layer),[num_output], initializer =initializer)
         out = tf.add(tf.matmul(out,w_out),b_out,name="out"+str(num_layer))
     else:
         out = tf.matmul(out,w_out,name="out"+str(num_layer))
-        
+    
+    if return_weight_tensors:
+        return out, weights
     return out
 
 
@@ -225,7 +245,27 @@ class Dataset():
     from sklearn.model_selection import train_test_split
     
     @classmethod
-    def generate_mixture_of_gaussians(cls, n, d, class_seps=[1], covariance_scale=1, test_size=0.2, one_hot=False, randomly_labeled=False, class_ratio=1, return_covariance=False, cov=None, resample=False):
+    def generate_moons(cls, n, d=2, test_size=0.2, one_hot=False, normalize_x=False, noise=0):
+        from sklearn.datasets import make_moons       
+        assert (d%2==0),"d should be even"
+        
+        X, y = make_moons(n, noise=noise)
+        
+        if normalize_x:
+            X = normalize(X)
+                
+        if (one_hot):
+            y = y.reshape(-1,1)
+            enc = cls.OneHotEncoder(n_values=2,sparse=False)
+            y = enc.fit_transform(y)
+        
+        X_train, X_test, y_train, y_test = cls.train_test_split(X, y, test_size=test_size)
+        
+        return X_train, X_test, y_train, y_test
+
+    
+    @classmethod
+    def generate_mixture_of_gaussians(cls, n, d, class_seps=[1], covariance_scale=1, test_size=0.2, one_hot=False, randomly_labeled=False, class_ratio=1, return_covariance=False, cov=None, resample=False, normalize_x=False):
         
         if len(class_seps)==d:
             pass
@@ -247,6 +287,9 @@ class Dataset():
             X1 = np.tile(X1, (class_ratio, 1))
             n_pos = n_pos*class_ratio
         X = np.concatenate([X1,X2])
+        
+        if normalize_x:
+            X = normalize(X)
         
         if randomly_labeled==True:
             y = np.random.randint(0,2,(n_pos+n_neg))
@@ -274,3 +317,112 @@ def pretty_plotting_styles():
     plt.rcParams["font.sans-serif"] = "Arial"
 
 
+
+    
+'''
+Returns an RNN with the following parameters:
+    window_size: the number of previous time_steps to use to make the prediction
+    dim: dimensionality of the input data
+    units: the number of hidden units in the LSTM
+'''
+def RNN(window_size=5, dim=1, units=32):
+    import keras
+    from keras.models import Model
+    from keras.layers import Dense, Input, LSTM
+        
+    x = Input(shape=(window_size, dim))
+    z, sh, sc = LSTM(units=units, return_state=True)(x)
+    z = Dense(1, activation='tanh')(z)
+    model = Model(inputs=[x],outputs=[z])
+    model.compile(loss='mse', optimizer='adam')
+    return model
+
+
+
+'''
+Converts a time-series into a form that can be used to train and validate an RNN
+'''
+def create_windowed_dataset(time_series, window_size=5, frac_train=0.8):
+    time_series = normalize(time_series)
+    X_train, y_train, X_test, y_test = [], [], [], []
+    n = len(time_series)-window_size-1
+    n_train = int(n*frac_train)
+    for i in range(n):
+        a = time_series[i:(i+window_size)]
+        if a.ndim==1:
+            a = a.reshape(-1, 1)
+        if i < n_train: 
+            X_train.append(a)
+            y_train.append(time_series[i+window_size])
+        else:
+            X_test.append(a)
+            y_test.append(time_series[i+window_size])
+    return np.array(X_train), np.array(y_train), np.array(X_test), np.array(y_test)
+
+def mse(y, y_):
+    y = y.flatten()
+    y_ = y_.flatten()
+    assert len(y)==len(y_), "arrays must be of the same length"
+    return np.round(np.sqrt(np.mean(np.square(y-y_))),2)
+
+'''
+Helper method to train and graph the results of RNN prediction
+'''
+def train_and_plot(time_series, window_sizes=None, hidden_units=None,epochs=20, figsize=None):
+    plt.rc("font",family="sans-serif",size=14)
+    
+    if not(figsize is None):
+        plt.figure(figsize=figsize)
+    if hidden_units is None:
+        if figsize is None:
+            plt.figure(figsize=[4*len(window_sizes),4])
+        for w, window_size in enumerate(window_sizes):
+            plt.subplot(1, len(window_sizes), w+1)
+            X_train, y_train, X_test, y_test = create_windowed_dataset(time_series, window_size=window_size)
+            rnn = RNN(window_size=window_size)
+            rnn.fit(X_train, y_train, epochs=epochs, verbose=0)
+            y_ = rnn.predict(X_test)
+            plt.plot(y_test)
+            plt.plot(y_,marker='.')
+            plt.title('Window size: '+str(window_size)+', RMSE: ' + str(mse(y_, y_test)))
+    elif window_sizes is None:
+        if figsize is None:
+            plt.figure(figsize=[4*len(hidden_units),4])
+        for h, hidden_unit in enumerate(hidden_units):
+            plt.subplot(1, len(hidden_units), h+1)
+            X_train, y_train, X_test, y_test = create_windowed_dataset(time_series)
+            rnn = RNN(units=hidden_unit)
+            rnn.fit(X_train, y_train, epochs=epochs, verbose=0)
+            y_ = rnn.predict(X_test)
+            plt.plot(y_test)
+            plt.plot(y_,marker='.')
+            plt.title('# Hidden Units: '+str(hidden_unit)+', RMSE: ' + str(mse(y_, y_test)))            
+    else:
+        if figsize is None:
+            plt.figure(figsize=[4*len(window_sizes), 4*len(hidden_units)])
+        count = 0 
+        for w, window_size in enumerate(window_sizes):
+            for h, hidden_unit in enumerate(hidden_units):
+                count += 1
+                plt.subplot(len(window_sizes), len(hidden_units), count)
+                X_train, y_train, X_test, y_test = create_windowed_dataset(time_series, window_size=window_size)
+                rnn = RNN(units=hidden_unit, window_size=window_size)
+                rnn.fit(X_train, y_train, epochs=epochs, verbose=0)
+                y_ = rnn.predict(X_test)
+                plt.plot(y_test)
+                plt.plot(y_,marker='.')
+                plt.title('Window: '+str(window_size)+', Hidden: '+str(hidden_unit)+', RMSE: ' + str(mse(y_, y_test)))
+    plt.legend(['Real','Predicted'])
+    
+def plot_decision_boundary(X, y, grid_pred):
+    xx, yy = np.meshgrid(np.arange(0, 1.02, 0.02), np.arange(0, 1.02, 0.02))
+    grid_points = np.c_[xx.ravel(), yy.ravel()]
+    plt.scatter(*X.T, marker='.', c=np.argmax(y, axis=1), alpha=1, cmap='RdBu')
+    zz = grid_pred[:,1].reshape(xx.shape)
+    plt.contourf(xx, yy, zz, cmap='RdBu', alpha=.2)
+    plt.xlim([0, 1]); plt.ylim([0,1])
+    plt.xlabel('Feature 1')
+    plt.ylabel('Feature 2')
+    
+    
+    
